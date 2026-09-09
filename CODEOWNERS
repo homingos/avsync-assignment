@@ -1,0 +1,15 @@
+# Everything needs owner review by default.
+*                       @sunayana-moro
+
+# These decide what runs with the truth secret. A submission PR must never
+# change them, and GitHub will require an owner review if one tries.
+/.github/               @sunayana-moro
+/tools/                 @sunayana-moro
+/score.py               @sunayana-moro
+/heldout_clip_ids.txt   @sunayana-moro
+
+# Swapping the public key would let someone seal a submission to a key we do
+# not hold, and swapping the crypto could weaken or bypass the sealing that
+# keeps candidates from reading each other's work.
+/tools/submission_key.pub   @sunayana-moro
+/tools/submission_crypto.py @sunayana-moro

@@ -1,0 +1,15 @@
+# Python 3.10-3.12. mediapipe wheels lag new Python releases, so 3.13+ may
+# have no wheel available; our CI runs 3.11.
+numpy>=1.24
+scipy>=1.10
+librosa>=0.10
+soundfile>=0.12
+# No opencv pin here on purpose. mediapipe depends on opencv-contrib-python,
+# and opencv-python / opencv-python-headless / opencv-contrib-python all
+# install into the SAME cv2/ directory. Listing a second distribution lets pip
+# resolve the two to different versions, which leaves a half-overwritten cv2
+# that imports but crashes. Let mediapipe bring its own; `import cv2` works.
+mediapipe>=0.10
+# Used only by tools/encrypt_submission.py, to seal your submission so other
+# candidates cannot read it.
+cryptography>=42.0

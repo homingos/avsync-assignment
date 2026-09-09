@@ -1,0 +1,448 @@
+name: Grade submissions
+
+# Grading needs the private held-out answers, so it must NEVER run in a context
+# a candidate can influence. Three safeguards:
+#
+#   1. It never triggers on `pull_request`. The only triggers are a manual run
+#      by a maintainer and a push to main.
+#   2. It runs in the `grading` Environment, which has a required reviewer, so
+#      every graded run waits for a human click before either secret exists on
+#      the runner.
+#   3. When grading a PR (the normal path), this workflow file is read from
+#      MAIN, not from the pull request. The PR contributes exactly one thing: a
+#      single encrypted file, read as data. This is what makes grading an
+#      unmerged PR safe, and it is precisely the property `pull_request_target`
+#      lacks -- that trigger checks out and can execute PR code with secrets in
+#      scope.
+#
+# Candidate code is never executed. run.py is checked for presence only.
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: 'PR number to grade WITHOUT merging, e.g. 7'
+        required: false
+      submission_dir:
+        description: 'Or a merged folder on main, e.g. submissions/octocat (blank = all)'
+        required: false
+  push:
+    branches: [main]
+    paths:
+      - 'submissions/**'
+
+run-name: >-
+  ${{ inputs.pr && format('Grade PR #{0}', inputs.pr)
+      || (inputs.submission_dir && format('Grade {0}', inputs.submission_dir))
+      || 'Grade merged submissions' }}
+
+permissions:
+  contents: write        # only to update the grading ledger branch, see below
+  actions: read
+  pull-requests: write   # to post the result as a comment on the PR
+
+jobs:
+  grade:
+    runs-on: ubuntu-latest
+    environment: grading
+    env:
+      # On a PUBLIC repository, Actions run logs, step summaries and uploaded
+      # artifacts are readable by anyone -- so while this is "true", candidate
+      # usernames and their p80 scores are public. That is a deliberate
+      # choice, and the README tells candidates it will happen before they
+      # submit.
+      #
+      # Set it to "false" if you would rather not publish applicant scores.
+      # The job still scores every submission and still fails loudly on a
+      # broken one; it just publishes no numbers, and you read them by running
+      #   python3 score.py --predictions <sub>/predictions.json \
+      #                    --truth truth.json --out report.json
+      # locally against the private truth. Nothing else needs to change.
+      PUBLISH_SCORES: "true"
+      # Differential probing: submitting two answers for one clip and diffing
+      # the reported score recovers that clip's truth when the score is a MEAN.
+      # Only p80 is published, which defeats that arithmetic, but the cap stays
+      # as defence in depth against whatever the next probe turns out to be.
+      MAX_GRADED: '3'
+      # Where the per-candidate graded count lives. It cannot be derived from
+      # git history any more: when grading unmerged PRs there are no merges to
+      # count, and counting a PR's own commits is useless because a candidate
+      # can amend them away or just open a fresh PR. So the count is keyed by
+      # CANDIDATE and kept on an orphan branch that main never sees.
+      LEDGER_BRANCH: grading-ledger
+    steps:
+      # Always main, never the pull request. See safeguard 3 above.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Pinned: this job holds the secrets, so an unpinned install would let a
+      # compromised release run with them in scope.
+      - run: pip install 'numpy==2.1.3' 'cryptography==46.0.3'
+
+      - name: Collect the submissions to grade
+        id: collect
+        env:
+          PR: ${{ inputs.pr }}
+          TARGET: ${{ inputs.submission_dir }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p inbox
+          # Each line of inbox/manifest.tsv is "<candidate>\t<path to .enc>".
+          : > inbox/manifest.tsv
+
+          if [ -n "${PR:-}" ]; then
+            # ---- Grade an UNMERGED pull request -------------------------
+            author=$(gh api "repos/$REPO/pulls/$PR" --jq .user.login)
+            state=$(gh api "repos/$REPO/pulls/$PR" --jq .state)
+            echo "PR #$PR by $author (state: $state)"
+
+            git fetch -q origin "pull/$PR/head:pr-head"
+
+            # Which submission folders does the PR touch? Derived from the
+            # diff against main, so a PR that changes nothing under
+            # submissions/ grades nothing.
+            dirs=$(git diff --name-only main...pr-head -- submissions/ \
+                   | awk -F/ 'NF>=2 {print $1"/"$2}' | sort -u)
+            count=$(printf '%s\n' "$dirs" | grep -c . || true)
+            if [ "$count" -ne 1 ]; then
+              echo "::error title=Bad submission shape::PR #$PR touches $count submission folders, expected 1."
+              exit 1
+            fi
+
+            # Re-checked HERE, not trusted from validate.yml. That check runs
+            # on the PR and a maintainer can dispatch this on any PR, including
+            # one whose checks are red -- so the folder/author binding that
+            # stops the submission cap being sidestepped has to be enforced on
+            # this side too.
+            if [ "$dirs" != "submissions/$author" ]; then
+              echo "::error title=Folder does not match author::PR #$PR adds $dirs but was opened by $author."
+              exit 1
+            fi
+
+            # Exactly one file, and it must be the sealed bundle. Anything else
+            # means plaintext leaked into a public PR.
+            files=$(git ls-tree -r --name-only pr-head -- "$dirs")
+            if [ "$files" != "$dirs/submission.enc" ]; then
+              echo "::error title=Bad submission contents::PR #$PR should contain only $dirs/submission.enc"
+              printf '%s\n' "$files" | sed 's/^/  /'
+              exit 1
+            fi
+
+            # Extract the blob alone. The PR is never checked out into the
+            # workspace, so no candidate file is ever placed on disk where
+            # something might execute it.
+            mkdir -p "inbox/$author"
+            git show "pr-head:$dirs/submission.enc" > "inbox/$author/submission.enc"
+            printf '%s\t%s\n' "$author" "inbox/$author/submission.enc" >> inbox/manifest.tsv
+
+          else
+            # ---- Grade what is merged on main --------------------------
+            if [ -n "${TARGET:-}" ]; then
+              printf '%s\n' "$TARGET" > /tmp/dirs.txt
+            else
+              find submissions -mindepth 1 -maxdepth 1 -type d | sort > /tmp/dirs.txt
+            fi
+            while IFS= read -r d; do
+              [ -n "$d" ] || continue
+              [ -f "$d/submission.enc" ] || { echo "skip $d (no submission.enc)"; continue; }
+              printf '%s\t%s\n' "$(basename "$d")" "$d/submission.enc" >> inbox/manifest.tsv
+            done < /tmp/dirs.txt
+          fi
+
+          n=$(wc -l < inbox/manifest.tsv | tr -d ' ')
+          echo "queued $n submission(s)"
+          if [ "$n" -eq 0 ]; then
+            echo "Nothing to grade."
+          fi
+
+      - name: Read the grading ledger
+        env:
+          LEDGER: ${{ env.LEDGER_BRANCH }}
+        run: |
+          set -euo pipefail
+          mkdir -p ledger
+          # The ledger is an orphan branch holding one file per candidate whose
+          # contents are the number of times they have been graded. Absent
+          # branch just means nobody has been graded yet.
+          if git fetch -q origin "$LEDGER:$LEDGER" 2>/dev/null; then
+            git ls-tree -r --name-only "$LEDGER" | while IFS= read -r f; do
+              mkdir -p "ledger/$(dirname "$f")"
+              git show "$LEDGER:$f" > "ledger/$f"
+            done
+            echo "ledger restored:"
+            for f in ledger/*; do [ -f "$f" ] && echo "  $(basename "$f") = $(cat "$f")"; done
+          else
+            echo "no ledger branch yet -- first grading run"
+          fi
+
+      - name: Restore private truth
+        env:
+          # Stored gzip+base64: the raw JSON is past GitHub's 48KB per-secret
+          # limit and compresses well.
+          #   gzip -9 -c truth.json | base64 -w0 | gh secret set HELDOUT_TRUTH_B64
+          HELDOUT_TRUTH_B64: ${{ secrets.HELDOUT_TRUTH_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HELDOUT_TRUTH_B64:-}" ]; then
+            echo "Secret HELDOUT_TRUTH_B64 is not set." >&2
+            exit 1
+          fi
+          mkdir -p .private
+          printf '%s' "$HELDOUT_TRUTH_B64" | base64 -d | gunzip > .private/truth.json
+          python3 -c "import json;d=json.load(open('.private/truth.json'));print(f'truth loaded: {len(d)} clips')"
+
+      - name: Score
+        env:
+          # Opens the sealed submissions. Separate from the truth secret so the
+          # two can be rotated independently.
+          SUBMISSION_PRIVKEY_B64: ${{ secrets.SUBMISSION_PRIVKEY_B64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p results work
+          # One line per candidate: "<name>\t<state>\t<detail>". The comment
+          # step below turns this into feedback on the PR. A FAILED submission
+          # is the case that matters most -- without a comment a candidate just
+          # sees a green PR and never learns their answer was unreadable.
+          : > results/outcomes.tsv
+          while IFS=$'\t' read -r name blob; do
+            [ -n "$name" ] || continue
+            prior=0
+            [ -f "ledger/$name" ] && prior=$(cat "ledger/$name")
+            next=$((prior + 1))
+            if [ "$next" -gt "$MAX_GRADED" ]; then
+              echo "::error title=Submission cap::$name has already been graded $prior time(s) (limit $MAX_GRADED). Not scoring."
+              printf '%s\tcapped\t%s\n' "$name" "$prior" >> results/outcomes.tsv
+              continue
+            fi
+            echo "=============================================="
+            echo "  $name  (graded run $next of $MAX_GRADED)"
+            echo "=============================================="
+
+            # The bundle is untrusted input, so decrypt_submission.py refuses
+            # link entries and any path that would write outside work/ -- this
+            # job holds the truth secret.
+            rm -rf "work/$name"
+            if ! python3 tools/decrypt_submission.py "$blob" --out-dir "work/$name"; then
+              echo "::error title=Undecryptable::$name could not be decrypted. Sealed to an old key, or truncated."
+              printf '%s\tundecryptable\t\n' "$name" >> results/outcomes.tsv
+              continue
+            fi
+            if [ ! -f "work/$name/predictions.json" ]; then
+              echo "::error title=No predictions::$name's bundle has no predictions.json."
+              printf '%s\tno_predictions\t\n' "$name" >> results/outcomes.tsv
+              continue
+            fi
+            # Format validation happens here, not on the PR: the PR job cannot
+            # read the plaintext. A bad submission is reported, not silently
+            # scored as nonsense.
+            # Capture the reason so the candidate is told WHAT was wrong, not
+            # just that something was.
+            if ! python3 tools/validate_submission.py \
+                        --predictions "work/$name/predictions.json" \
+                        --clip-ids heldout_clip_ids.txt > "work/$name/validate.log" 2>&1; then
+              cat "work/$name/validate.log"
+              echo "::error title=Invalid predictions::$name's predictions.json failed validation."
+              printf '%s\tinvalid\t\n' "$name" >> results/outcomes.tsv
+              continue
+            fi
+            cat "work/$name/validate.log"
+            # --summary-out implies --public, so score.py itself withholds the
+            # mean and the per-regime breakdown.
+            if python3 score.py --predictions "work/$name/predictions.json" \
+                                --truth .private/truth.json \
+                                --summary-out "results/$name.json"; then
+              # Only a run that actually produced a score consumes an attempt.
+              echo "$next" > "ledger/$name"
+              printf '%s\tscored\t%s\n' "$name" "$next" >> results/outcomes.tsv
+            else
+              echo "  scoring failed for $name"
+              printf '%s\terror\t\n' "$name" >> results/outcomes.tsv
+            fi
+          done < inbox/manifest.tsv
+
+      - name: Update the grading ledger
+        if: always()
+        env:
+          LEDGER: ${{ env.LEDGER_BRANCH }}
+          # Via env, not interpolated into the command: a token on a command
+          # line can surface in a process listing or a traced log.
+          GH_TOKEN_PUSH: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(ledger/*)
+          if [ ${#files[@]} -eq 0 ]; then echo "nothing to record"; exit 0; fi
+          # Committed to an orphan branch so the ledger never appears on main
+          # and never shows up in a candidate's clone of the default branch.
+          tmp=$(mktemp -d); cp -r ledger/. "$tmp/"
+          cd "$tmp"
+          git init -q -b "$LEDGER" .
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Grading ledger $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push -q --force \
+            "https://x-access-token:${GH_TOKEN_PUSH}@github.com/${REPO}.git" \
+            "$LEDGER:$LEDGER"
+          echo "ledger updated:"
+          for f in *; do [ -f "$f" ] && echo "  $f = $(cat "$f")"; done
+
+      - name: Submission audit
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "### Graded attempts used"
+            echo ""
+            echo "| candidate | graded runs | at cap |"
+            echo "|---|---|---|"
+            shopt -s nullglob
+            for f in ledger/*; do
+              n=$(cat "$f")
+              at="no"; [ "$n" -ge "$MAX_GRADED" ] && at="**YES**"
+              echo "| $(basename "$f") | $n / $MAX_GRADED | $at |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Leaderboard
+        if: env.PUBLISH_SCORES == 'true'
+        run: |
+          python3 tools/leaderboard.py results --out results/LEADERBOARD.md
+          cat results/LEADERBOARD.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Scoring completed (scores withheld)
+        if: env.PUBLISH_SCORES != 'true'
+        run: |
+          n=$(ls results/*.json 2>/dev/null | wc -l | tr -d ' ')
+          echo "Scored $n submission(s). Scores withheld from public output."
+          echo "Run score.py locally against the private truth to read them."
+
+      - name: Remove truth and decrypted submissions from the runner
+        if: always()
+        run: rm -rf .private work inbox
+
+      # Deliberately after the cleanup above: composing and posting a comment
+      # must never run while the truth is still on the runner.
+      - name: Comment the result on the PR
+        if: always() && inputs.pr != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ inputs.pr }}
+          MAX: ${{ env.MAX_GRADED }}
+          PUBLISH: ${{ env.PUBLISH_SCORES }}
+        run: |
+          set -uo pipefail
+          if [ ! -s results/outcomes.tsv ]; then
+            body="### Grading did not run
+
+          Nothing was scored. This usually means the submission was not shaped
+          as expected -- see the workflow log linked on this pull request."
+          else
+            IFS=$'\t' read -r name state detail < results/outcomes.tsv
+            case "$state" in
+              scored)
+                if [ "$PUBLISH" = "true" ]; then
+                  p80=$(python3 -c "import json;print(f\"{json.load(open('results/$name.json'))['p80_error_ms']:.2f}\")")
+                  n=$(python3 -c "import json;print(json.load(open('results/$name.json'))['n_scored'])")
+                  miss=$(python3 -c "import json;print(json.load(open('results/$name.json'))['n_missing_predictions'])")
+                  extra=""
+                  [ "$miss" != "0" ] && extra="
+
+          > **$miss clip(s) had no prediction.** Missing clips count against you, so this is worth fixing."
+                  body="### Score: **${p80} ms**
+
+          That is your **p80 error** -- the error your worst 20% of clips stay
+          under. Lower is better. Scored on $n clips.
+
+          Attempt **${detail} of ${MAX}**.
+
+          We do not share per-clip results. You have the full breakdown on the
+          dev set, where the answers are already yours.${extra}"
+                else
+                  body="### Submission graded
+
+          Your submission was decrypted, validated and scored successfully
+          (attempt **${detail} of ${MAX}**).
+
+          We are not publishing scores on this repository, so we will send
+          yours to you directly."
+                fi
+                ;;
+              capped)
+                body="### Not scored -- no attempts left
+
+          You have already been graded **${detail}** times, and the limit is
+          **${MAX}**. This is not about rushing you: a score that can be
+          queried without limit can be worked backwards into the answers.
+
+          Getting the format check green costs you nothing -- only a graded run
+          counts. Talk to us if you think this is wrong."
+                ;;
+              undecryptable)
+                body="### Could not open your submission
+
+          \`submission.enc\` failed to decrypt. Two usual causes:
+
+          - it was sealed to an older key -- pull the latest \`main\` and re-run
+            \`python3 tools/encrypt_submission.py submissions/YOUR_USERNAME\`
+          - the file was truncated in transit -- check its size locally matches
+            what is committed
+
+          No attempt was used. Push a fix and we will re-grade."
+                ;;
+              no_predictions)
+                body="### Your bundle has no \`predictions.json\`
+
+          The encrypted file opened, but there was no \`predictions.json\`
+          inside. Re-run
+          \`python3 tools/encrypt_submission.py submissions/YOUR_USERNAME\`
+          from the folder that contains your answers.
+
+          No attempt was used."
+                ;;
+              invalid)
+                body="### Your predictions did not pass validation
+
+          The file opened but the contents were not usable -- wrong clip ids, a
+          missing clip, or a malformed record. Run this locally to see exactly
+          what:
+
+          \`\`\`bash
+          python3 tools/validate_submission.py \\
+            --predictions submissions/YOUR_USERNAME/predictions.json \\
+            --clip-ids heldout_clip_ids.txt
+          \`\`\`
+
+          \`encrypt_submission.py\` runs that check for you and refuses to
+          package a bad file, so this usually means it was bypassed.
+
+          No attempt was used."
+                ;;
+              *)
+                body="### Grading failed
+
+          Something went wrong while scoring your submission. This is on our
+          side, not yours -- no attempt was used and we will look into it."
+                ;;
+            esac
+          fi
+          printf '%s\n' "$body" > /tmp/comment.md
+          cat /tmp/comment.md
+          gh pr comment "$PR" --repo "$REPO" --body-file /tmp/comment.md
+
+      # Redacted summaries only. Skipped entirely unless PUBLISH_SCORES is
+      # "true", since artifacts on a public repo are world-readable.
+      - uses: actions/upload-artifact@v4
+        if: env.PUBLISH_SCORES == 'true'
+        with:
+          name: results-summary
+          path: results/
