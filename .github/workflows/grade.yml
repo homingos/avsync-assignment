@@ -114,12 +114,13 @@ jobs:
           HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
         run: |
           set -euo pipefail
+          # `gh api --jq` takes the expression only: it does not accept jq's
+          # own --arg flag. Values come in through jq's `env` instead.
           pr=$(gh api "repos/$REPO/pulls?state=open&per_page=100" \
-                 --jq --arg s "$SHA" --arg b "$BRANCH" --arg r "$HEAD_REPO" \
-                 '[.[] | select((.head.sha == $s)
-                                or (.head.ref == $b
-                                    and .head.repo.full_name == $r))
-                       | .number] | first // empty')
+                 --jq '[.[] | select((.head.sha == env.SHA)
+                                     or (.head.ref == env.BRANCH
+                                         and .head.repo.full_name == env.HEAD_REPO))
+                            | .number] | first // empty')
           if [ -z "$pr" ]; then
             echo "No open pull request matches $HEAD_REPO@$BRANCH ($SHA)."
           else
