@@ -103,17 +103,33 @@ jobs:
       # the head the validate run used. Matching on head repo AND branch as
       # well as sha, because a pull_request run's head_sha is not guaranteed to
       # be the branch tip.
+      # Runs on EVERY trigger and is the single source of truth for "which
+      # pull request is this?". Every later step reads steps.resolve.outputs.pr
+      # rather than inputs.pr, because inputs.pr is empty on the workflow_run
+      # path and a step that reads it directly silently does nothing.
       - name: Resolve the pull request to grade
         id: resolve
-        if: github.event_name == 'workflow_run'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          INPUT_PR: ${{ inputs.pr }}
           SHA: ${{ github.event.workflow_run.head_sha }}
           BRANCH: ${{ github.event.workflow_run.head_branch }}
           HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
         run: |
           set -euo pipefail
+          # A maintainer naming the PR wins over any lookup.
+          if [ -n "${INPUT_PR:-}" ]; then
+            echo "grading PR #$INPUT_PR (named on dispatch)"
+            echo "pr=$INPUT_PR" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Grading merged folders on main: no pull request involved.
+          if [ "${EVENT:-}" != "workflow_run" ]; then
+            echo "pr=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           # `gh api --jq` takes the expression only: it does not accept jq's
           # own --arg flag. Values come in through jq's `env` instead.
           pr=$(gh api "repos/$REPO/pulls?state=open&per_page=100" \
@@ -131,7 +147,7 @@ jobs:
       - name: Collect the submissions to grade
         id: collect
         env:
-          PR: ${{ inputs.pr || steps.resolve.outputs.pr }}
+          PR: ${{ steps.resolve.outputs.pr }}
           TARGET: ${{ inputs.submission_dir }}
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -393,11 +409,11 @@ jobs:
       # Deliberately after the cleanup above: composing and posting a comment
       # must never run while the truth is still on the runner.
       - name: Comment the result on the PR
-        if: always() && inputs.pr != ''
+        if: always() && steps.resolve.outputs.pr != ''
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          PR: ${{ inputs.pr }}
+          PR: ${{ steps.resolve.outputs.pr }}
           MAX: ${{ env.MAX_GRADED }}
           PUBLISH: ${{ env.PUBLISH_SCORES }}
         run: |
