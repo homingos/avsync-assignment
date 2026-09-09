@@ -1,0 +1,27 @@
+# Clips are downloaded, never committed.
+data/
+*.mp4
+*.wav
+*.mkv
+*.npy
+*.tar
+*.tar.gz
+*.zip
+
+.private/
+results/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+
+# Your submission is committed ENCRYPTED, as submissions/<you>/submission.enc.
+# These are the plaintext files it is built from -- ignored so they cannot be
+# committed by accident. Committing them would publish your answers and your
+# code to every other candidate, since pull requests on a public repo are
+# readable by anyone.
+submissions/*/predictions.json
+submissions/*/run.py
+submissions/*/run.sh
+submissions/*/METHOD.md
