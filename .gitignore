@@ -25,3 +25,4 @@ submissions/*/predictions.json
 submissions/*/run.py
 submissions/*/run.sh
 submissions/*/METHOD.md
+face_landmarker.task

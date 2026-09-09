@@ -259,6 +259,12 @@ jobs:
               # Only a run that actually produced a score consumes an attempt.
               echo "$next" > "ledger/$name"
               printf '%s\tscored\t%s\n' "$name" "$next" >> results/outcomes.tsv
+              # Keep a running record per candidate on the ledger branch. The
+              # leaderboard is built from these, so it shows everyone ever
+              # graded and every attempt -- not just this run, which grades a
+              # single submission.
+              python3 tools/record_attempt.py --name "$name" --attempt "$next" \
+                      --summary "results/$name.json" --scores-dir ledger/scores
             else
               echo "  scoring failed for $name"
               printf '%s\terror\t\n' "$name" >> results/outcomes.tsv
@@ -313,7 +319,7 @@ jobs:
       - name: Leaderboard
         if: env.PUBLISH_SCORES == 'true'
         run: |
-          python3 tools/leaderboard.py results --out results/LEADERBOARD.md
+          python3 tools/leaderboard.py ledger/scores --out results/LEADERBOARD.md
           cat results/LEADERBOARD.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Scoring completed (scores withheld)
