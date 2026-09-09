@@ -310,6 +310,9 @@ jobs:
             echo "|---|---|---|"
             shopt -s nullglob
             for f in ledger/*; do
+              # ledger/ holds one count file per candidate AND a scores/
+              # directory; skip anything that is not a count file.
+              [ -f "$f" ] || continue
               n=$(cat "$f")
               at="no"; [ "$n" -ge "$MAX_GRADED" ] && at="**YES**"
               echo "| $(basename "$f") | $n / $MAX_GRADED | $at |"
