@@ -1,0 +1,170 @@
+name: Validate submission
+
+# pull_request (NOT pull_request_target) is deliberate. Fork PRs on this
+# trigger get a read-only token and NO access to repository secrets, so the
+# held-out answers are unreachable from any code a student can influence.
+# That is why this job only checks format and never computes a score.
+on:
+  pull_request:
+    paths:
+      - 'submissions/**'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the steps below diff against the base branch, which a
+          # shallow (depth-1) clone cannot do.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Find the submission in this PR
+        id: find
+        env:
+          # Anything derived from the pull request comes through env rather
+          # than being interpolated into the script body.
+          BASE_REF: ${{ github.base_ref }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+          # Only look at submissions/, so a PR touching anything else is ignored.
+          dirs=$(git -c core.quotepath=false diff --name-only \
+                   "origin/$BASE_REF...HEAD" -- submissions/ \
+                 | awk -F/ 'NF>=2 {print $1"/"$2}' | sort -u)
+          count=$(echo "$dirs" | grep -c . || true)
+          if [ "$count" -eq 0 ]; then
+            echo "No files added under submissions/." >&2
+            echo "Add submissions/YOUR_USERNAME/predictions.json and push again." >&2
+            exit 1
+          fi
+          if [ "$count" -gt 1 ]; then
+            echo "This PR touches more than one submission folder:" >&2
+            echo "$dirs" >&2
+            echo "Please submit exactly one." >&2
+            exit 1
+          fi
+          # The submission folder MUST equal the PR author's login, exactly.
+          # The grading cap counts merges per folder path, so without this a
+          # candidate simply submits as "name", exhausts the three graded
+          # revisions, then opens "name-v2" for three more, indefinitely.
+          # Binding folder to author means one canonical folder per person, so
+          # bypassing it needs a whole new GitHub account -- which a
+          # maintainer sees when reviewing the PR. Exact match, not
+          # case-insensitive: "Alice" and "alice" are different git paths and
+          # would each get their own count.
+          want="submissions/$PR_AUTHOR"
+          if [ "$dirs" != "$want" ]; then
+            echo "Submission folder must be named after your GitHub username." >&2
+            echo "  found:    $dirs" >&2
+            echo "  expected: $want" >&2
+            echo "Rename the folder to exactly '$PR_AUTHOR' and push again." >&2
+            exit 1
+          fi
+          echo "dir=$dirs" >> "$GITHUB_OUTPUT"
+
+      - name: Check the submission is a single sealed file
+        env:
+          SUB_DIR: ${{ steps.find.outputs.dir }}
+        run: |
+          set -euo pipefail
+          d="$SUB_DIR"
+          # Submissions are encrypted, so this job cannot read them -- it has
+          # no secrets (fork PRs get none) and that is the point. All it can
+          # check is the shape: exactly one file, named submission.enc.
+          #
+          # Rejecting anything else is also what protects the candidate. A
+          # stray predictions.json here would be publicly readable, which is
+          # the whole problem encryption exists to solve.
+          files=$(git -c core.quotepath=false ls-files "$d")
+          n=$(printf '%s\n' "$files" | grep -c . || true)
+          if [ "$n" -ne 1 ] || [ "$files" != "$d/submission.enc" ]; then
+            echo "Your submission folder must contain exactly one file: submission.enc" >&2
+            echo "" >&2
+            echo "Found:" >&2
+            printf '%s\n' "$files" | sed 's/^/  /' >&2
+            echo "" >&2
+            echo "Build it with:" >&2
+            echo "  python3 tools/encrypt_submission.py $d" >&2
+            echo "then commit only $d/submission.enc." >&2
+            echo "Keep your predictions.json, run.py and METHOD.md locally --" >&2
+            echo "committing them would publish your work to every other candidate." >&2
+            exit 1
+          fi
+          echo "Found $d/submission.enc"
+
+      - name: Reject committed video or data files
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          if git diff --name-only "origin/$BASE_REF...HEAD" \
+               | grep -Ei '\.(mp4|wav|mkv|mov|avi|npy|tar|tar\.gz|zip)$'; then
+            echo ""
+            echo "Media/data files must not be committed. Remove them and push again."
+            exit 1
+          fi
+          echo "No media or archive files committed."
+
+      - name: Refuse changes outside submissions/
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          # grade.yml runs with the truth secret on merge to main, so a PR that
+          # edits workflows, the scorer, or the clip-id list is a potential
+          # exfiltration path. Submissions only ever need files under
+          # submissions/, so anything else is rejected here as well as by
+          # CODEOWNERS review.
+          outside=$(git diff --name-only "origin/$BASE_REF...HEAD" \
+                    | grep -v '^submissions/' || true)
+          if [ -n "$outside" ]; then
+            echo "This PR changes files outside submissions/:"
+            echo "$outside" | sed 's/^/  /'
+            echo ""
+            echo "A submission should only add files under submissions/YOUR_USERNAME/."
+            echo "Please revert the other changes."
+            exit 1
+          fi
+          echo "Only submissions/ touched."
+
+      - name: Check the sealed file is well formed
+        env:
+          SUB_DIR: ${{ steps.find.outputs.dir }}
+        run: |
+          set -euo pipefail
+          # Structure only: right magic bytes, plausible size. Whether the
+          # PREDICTIONS inside are valid was already checked on your machine by
+          # encrypt_submission.py, which refuses to package an invalid file --
+          # that check moved there because it needs to read the plaintext.
+          python3 - "$SUB_DIR/submission.enc" <<'PY'
+          import sys
+          sys.path.insert(0, "tools")
+          from submission_crypto import looks_sealed, MAGIC
+
+          path = sys.argv[1]
+          blob = open(path, "rb").read()
+          if not looks_sealed(blob):
+              print(f"{path} is not a sealed submission.", file=sys.stderr)
+              print(f"  size: {len(blob)} bytes", file=sys.stderr)
+              print(f"  first bytes: {blob[:8]!r} (expected {MAGIC!r})", file=sys.stderr)
+              print("", file=sys.stderr)
+              print("Regenerate it with:", file=sys.stderr)
+              print("  python3 tools/encrypt_submission.py <your folder>", file=sys.stderr)
+              raise SystemExit(1)
+          limit = 5 * 1024 * 1024
+          if len(blob) > limit:
+              print(f"{path} is {len(blob)/1e6:.1f}MB, over the 5MB limit.", file=sys.stderr)
+              raise SystemExit(1)
+          print(f"{path} is a well-formed sealed submission ({len(blob)} bytes).")
+          PY
+
+          echo ""
+          echo "Submission accepted for grading. This says nothing about accuracy."
