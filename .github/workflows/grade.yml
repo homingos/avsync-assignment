@@ -3,11 +3,14 @@ name: Grade submissions
 # Grading needs the private held-out answers, so it must NEVER run in a context
 # a candidate can influence. Three safeguards:
 #
-#   1. It never triggers on `pull_request`. The only triggers are a manual run
-#      by a maintainer and a push to main.
-#   2. It runs in the `grading` Environment, which has a required reviewer, so
-#      every graded run waits for a human click before either secret exists on
-#      the runner.
+#   1. It never triggers on `pull_request` or `pull_request_target`. It reacts
+#      to `workflow_run`, which fires only AFTER the unprivileged validate job
+#      has finished, and which always runs the copy of THIS FILE that is on
+#      main -- so a pull request cannot change what grading does.
+#   2. It runs in the `grading` Environment, so every graded run is recorded as
+#      a deployment. Adding a required reviewer to that environment puts a
+#      human click back in front of the secrets; without one, grading is
+#      automatic.
 #   3. When grading a PR (the normal path), this workflow file is read from
 #      MAIN, not from the pull request. The PR contributes exactly one thing: a
 #      single encrypted file, read as data. This is what makes grading an
@@ -29,10 +32,18 @@ on:
     branches: [main]
     paths:
       - 'submissions/**'
+  # Auto-grade: react to the format check finishing. workflow_run runs in the
+  # base repository with secrets available, but it does NOT check out the pull
+  # request, and the workflow definition always comes from main.
+  workflow_run:
+    workflows: ["Validate submission"]
+    types: [completed]
 
 run-name: >-
   ${{ inputs.pr && format('Grade PR #{0}', inputs.pr)
       || (inputs.submission_dir && format('Grade {0}', inputs.submission_dir))
+      || (github.event_name == 'workflow_run'
+          && format('Grade {0}', github.event.workflow_run.head_branch))
       || 'Grade merged submissions' }}
 
 permissions:
@@ -43,6 +54,11 @@ permissions:
 jobs:
   grade:
     runs-on: ubuntu-latest
+    # A red format check grades nothing. Manual runs are unaffected, so a
+    # maintainer can still dispatch on a PR whose checks are failing.
+    if: >-
+      github.event_name != 'workflow_run'
+      || github.event.workflow_run.conclusion == 'success'
     environment: grading
     env:
       # On a PUBLIC repository, Actions run logs, step summaries and uploaded
@@ -82,13 +98,43 @@ jobs:
       # compromised release run with them in scope.
       - run: pip install 'numpy==2.1.3' 'cryptography==46.0.3'
 
+      # workflow_run does not tell us the pull request: for fork PRs the
+      # payload's `pull_requests` array is always empty. So we look it up from
+      # the head the validate run used. Matching on head repo AND branch as
+      # well as sha, because a pull_request run's head_sha is not guaranteed to
+      # be the branch tip.
+      - name: Resolve the pull request to grade
+        id: resolve
+        if: github.event_name == 'workflow_run'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+        run: |
+          set -euo pipefail
+          pr=$(gh api "repos/$REPO/pulls?state=open&per_page=100" \
+                 --jq --arg s "$SHA" --arg b "$BRANCH" --arg r "$HEAD_REPO" \
+                 '[.[] | select((.head.sha == $s)
+                                or (.head.ref == $b
+                                    and .head.repo.full_name == $r))
+                       | .number] | first // empty')
+          if [ -z "$pr" ]; then
+            echo "No open pull request matches $HEAD_REPO@$BRANCH ($SHA)."
+          else
+            echo "validate run maps to PR #$pr"
+          fi
+          echo "pr=$pr" >> "$GITHUB_OUTPUT"
+
       - name: Collect the submissions to grade
         id: collect
         env:
-          PR: ${{ inputs.pr }}
+          PR: ${{ inputs.pr || steps.resolve.outputs.pr }}
           TARGET: ${{ inputs.submission_dir }}
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
           mkdir -p inbox
@@ -139,6 +185,13 @@ jobs:
             mkdir -p "inbox/$author"
             git show "pr-head:$dirs/submission.enc" > "inbox/$author/submission.enc"
             printf '%s\t%s\n' "$author" "inbox/$author/submission.enc" >> inbox/manifest.tsv
+
+          elif [ "${EVENT:-}" = "workflow_run" ]; then
+            # A validate run finished but no open pull request matches it.
+            # Grade nothing. Falling through to the merged-on-main path here
+            # would re-grade every existing submission and burn an attempt for
+            # every candidate.
+            echo "Nothing to grade for this validate run."
 
           else
             # ---- Grade what is merged on main --------------------------

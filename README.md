@@ -142,13 +142,17 @@ It does **not** tell you your score. A green check means your submission can be
 opened and read, not that it is accurate.
 
 If the check fails, read the comment, push a fix to the same branch, and the
-check runs again. Iterating until it is green is expected and costs you nothing
-— pushes to your branch are not graded, only the merge is.
+check runs again. A failing check costs you nothing, so iterate until it is
+green.
 
-**You get up to 3 graded submissions.** Your PR is scored once we review it; if
-you later want to revise, push again and ask for a re-grade, up to three times
-total. It is not there to rush you. Getting the format check green costs you
-none of the three.
+**You get up to 3 graded submissions, and grading is automatic.** As soon as
+the format check passes, your submission is scored and the result is posted as
+a comment on your pull request. You do not need to ask.
+
+Because it is automatic, **every push that passes the format check uses up one
+of your three attempts.** So get the check green first, and only then push the
+predictions you actually want scored. If you run out, the format check still
+works, but no further score is posted.
 
 ## 5. How you are scored
 
