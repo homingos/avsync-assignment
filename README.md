@@ -1,5 +1,5 @@
 # AV-Sync Offset Estimation — Assignment
-
+change something
 In each video clip, the **audio has been shifted in time** relative to the video.
 Your job: measure that shift, in milliseconds.
 
