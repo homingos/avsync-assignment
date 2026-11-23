@@ -1,0 +1,16 @@
+{
+ "attempts": [
+  {
+   "n": 1,
+   "p80_error_ms": 23.206,
+   "n_scored": 80,
+   "n_missing_predictions": 0
+  },
+  {
+   "n": 2,
+   "p80_error_ms": 21.122,
+   "n_scored": 80,
+   "n_missing_predictions": 0
+  }
+ ]
+}
